@@ -3,6 +3,7 @@
 // It wires everything together:
 //   security headers → body parsing → cookies → who-is-this → API routes
 //   → frontend files (public/) → error handling → start listening
+// Works locally, on Render, and on Vercel.
 // ─────────────────────────────────────────────────────────────
 import "./src/env.js"; // MUST be first: loads .env into process.env
 import express from "express";
@@ -20,7 +21,7 @@ const missing = ["DATABASE_URL", "SESSION_SECRET"].filter((key) => !process.env[
 if (missing.length) {
   console.error(`\n❌ Missing environment variable(s): ${missing.join(", ")}`);
   console.error("   Locally: copy .env.example to .env and fill it in.");
-  console.error("   On Render: add them under your service → Environment.\n");
+  console.error("   On Render/Vercel: add them in your project's Environment Variables.\n");
   process.exit(1);
 }
 
@@ -28,8 +29,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Render (and most hosts) put a proxy in front of your app. This lets
-// Express see the real visitor IP (needed for rate limiting) and HTTPS.
+// Hosts put a proxy in front of your app. This lets Express see the
+// real visitor IP (needed for rate limiting) and HTTPS.
 app.set("trust proxy", 1);
 
 // 2) Security headers. The Content-Security-Policy is an allow-list of
@@ -58,6 +59,20 @@ app.use(
 app.use(express.json({ limit: "10kb" }));
 app.use(cookieParser());
 
+// On Vercel there is no startup phase, so create the tables lazily
+// on the first API request instead.
+let dbReady;
+app.use("/api", async (req, res, next) => {
+  if (!process.env.VERCEL) return next(); // locally, step 7 handles it
+  try {
+    await (dbReady ??= initDb());
+    next();
+  } catch (err) {
+    dbReady = undefined; // retry on the next request
+    next(err);
+  }
+});
+
 // 4) API routes. Everything under /api returns JSON.
 app.use("/api", rateLimit({ windowMs: 60 * 1000, limit: 200 })); // general safety net
 app.use("/api", loadUser);                                         // sets req.user
@@ -83,15 +98,20 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Something went wrong on our side. Please try again." });
 });
 
-// 7) Create tables, then start listening for requests.
-try {
-  await initDb();
-  app.listen(PORT, () => {
-    console.log(`\n🪷 Chaupal is running → http://localhost:${PORT}`);
-    console.log(process.env.GOOGLE_CLIENT_ID ? "   Google sign-in: ON" : "   Google sign-in: OFF (guest mode only)");
-  });
-} catch (err) {
-  console.error("\n❌ Could not connect to the database. Check DATABASE_URL in your .env");
-  console.error("  ", err.message, "\n");
-  process.exit(1);
+// 7) Locally and on Render: create tables, then start listening.
+//    On Vercel the platform runs the exported app itself, so we skip listen().
+if (!process.env.VERCEL) {
+  try {
+    await initDb();
+    app.listen(PORT, () => {
+      console.log(`\n🪷 Chaupal is running → http://localhost:${PORT}`);
+      console.log(process.env.GOOGLE_CLIENT_ID ? "   Google sign-in: ON" : "   Google sign-in: OFF (guest mode only)");
+    });
+  } catch (err) {
+    console.error("\n❌ Could not connect to the database. Check DATABASE_URL in your .env");
+    console.error("  ", err.message, "\n");
+    process.exit(1);
+  }
 }
+
+export default app;
